@@ -1,0 +1,309 @@
+<script setup lang="ts">
+import { useChat } from '@ai-sdk/vue'
+import { DefaultChatTransport } from 'ai'
+import type { UIMessage } from 'ai'
+import type { ChatPromptQueueItem } from '@nuxt/ui'
+
+const route = useRoute()
+const toast = useToast()
+const { model } = useModels()
+const { webSearch, reasoning } = useChatSettings()
+const { csrf, headerName } = useCsrf()
+
+const { data } = await useFetch(`/api/chats/${route.params.id}`, {
+  key: `chat-${route.params.id}`,
+  cache: 'force-cache'
+})
+
+const isOwner = computed(() => data.value?.isOwner ?? false)
+const visibility = ref<'public' | 'private'>(data.value?.visibility ?? 'private')
+const title = ref<string | null>(data.value?.title ?? null)
+
+watch(() => data.value?.title, (next) => {
+  title.value = next ?? null
+})
+
+// Messages sent while a response streams wait here, `UChatPrompt` queues a submit while the chat is busy
+const queue = ref<ChatPromptQueueItem[]>([])
+
+const {
+  files,
+  promptFiles,
+  uploading,
+  uploadedFiles,
+  isQueuedUploading,
+  takeQueuedFiles,
+  clearFiles
+} = useFileUploadWithStatus(route.params.id as string, queue)
+
+const { data: votes } = await useLazyFetch(`/api/chats/${route.params.id}/votes`, {
+  immediate: isOwner.value
+})
+
+const input = ref('')
+
+const { messages, status, error, sendMessage, regenerate, stop } = useChat({
+  id: data.value?.id,
+  messages: data.value?.messages,
+  transport: new DefaultChatTransport({
+    api: `/api/chats/${data.value?.id}`,
+    headers: { [headerName]: csrf },
+    body: () => ({
+      model: model.value,
+      webSearch: webSearch.value,
+      reasoning: reasoning.value
+    })
+  }),
+  onData: async (dataPart) => {
+    if (dataPart.type === 'data-chat-title') {
+      await refreshNuxtData('chats')
+      const chatsCache = useNuxtData<{ id: string, label: string }[]>('chats')
+      const updated = chatsCache.data.value?.find(c => c.id === data.value!.id)
+      if (updated && updated.label !== 'Untitled') {
+        title.value = updated.label
+      }
+    }
+  },
+  onError(error) {
+    let message = error.message
+    if (typeof message === 'string' && message[0] === '{') {
+      try {
+        message = JSON.parse(message).message || message
+      } catch {
+        // keep original message on malformed JSON
+      }
+    }
+
+    toast.add({
+      description: message,
+      icon: 'i-lucide-alert-circle',
+      color: 'error',
+      duration: 0
+    })
+  }
+})
+
+async function handleSubmit(e: Event) {
+  e.preventDefault()
+  if ((input.value.trim() || uploadedFiles.value.length) && !uploading.value) {
+    const files = uploadedFiles.value.length > 0 ? uploadedFiles.value : undefined
+    sendMessage(input.value.trim() ? { text: input.value, files } : { files: files! })
+    input.value = ''
+    clearFiles()
+  }
+}
+
+function sendNext() {
+  // A queued message waits for its files to finish uploading
+  if (!queue.value[0] || isQueuedUploading(queue.value[0].files)) return
+
+  const next = queue.value.shift()!
+
+  const parts = takeQueuedFiles(next.files)
+  // Nothing left to send when its only file failed to upload
+  if (!next.text.trim() && !parts.length) return sendNext()
+
+  // An array, even empty, starts the request right away: `undefined` is read as a `FileList` first while `status` stays `ready`
+  sendMessage(next.text.trim() ? { text: next.text, files: parts } : { files: parts })
+}
+
+// Also runs when the files of the next queued message finish uploading
+watch([status, () => isQueuedUploading(queue.value[0]?.files)], () => {
+  if (status.value === 'ready') {
+    sendNext()
+  }
+})
+
+// A queued message picked to be sent now is at the front of the queue, it goes out once the current response stops
+function onSend() {
+  if (status.value === 'submitted' || status.value === 'streaming') {
+    stop()
+  } else {
+    sendNext()
+  }
+}
+
+const editingMessageId = ref<string | null>(null)
+
+function startEdit(message: UIMessage) {
+  if (editingMessageId.value) return
+
+  editingMessageId.value = message.id
+}
+
+async function saveEdit(message: UIMessage, text: string) {
+  try {
+    await $fetch(`/api/chats/${data.value!.id}/messages`, {
+      method: 'DELETE',
+      headers: { [headerName]: csrf },
+      body: { messageId: message.id, type: 'edit' }
+    })
+  } catch {
+    toast.add({ description: 'Failed to save edit.', icon: 'i-lucide-alert-circle', color: 'error' })
+    return
+  }
+
+  editingMessageId.value = null
+  sendMessage({ text, messageId: message.id })
+}
+
+async function regenerateMessage(message: UIMessage) {
+  try {
+    await $fetch(`/api/chats/${data.value!.id}/messages`, {
+      method: 'DELETE',
+      headers: { [headerName]: csrf },
+      body: { messageId: message.id, type: 'regenerate' }
+    })
+  } catch {
+    toast.add({ description: 'Failed to regenerate.', icon: 'i-lucide-alert-circle', color: 'error' })
+    return
+  }
+
+  regenerate({ messageId: message.id })
+}
+
+function getVote(messageId: string) {
+  const vote = votes.value?.find(v => v.messageId === messageId)
+  if (!vote) return null
+  return !!vote.isUpvoted
+}
+
+async function vote(message: UIMessage, isUpvoted: boolean) {
+  const snapshot = (votes.value ?? []).map(v => ({ ...v }))
+  const toggling = getVote(message.id) === isUpvoted
+  const next = toggling ? null : isUpvoted
+
+  votes.value = next === null
+    ? (votes.value ?? []).filter(v => v.messageId !== message.id)
+    : [
+        ...(votes.value ?? []).filter(v => v.messageId !== message.id),
+        { chatId: data.value!.id, messageId: message.id, isUpvoted: next }
+      ]
+
+  try {
+    await $fetch(`/api/chats/${data.value!.id}/votes`, {
+      method: 'POST',
+      headers: { [headerName]: csrf },
+      body: next === null ? { messageId: message.id } : { messageId: message.id, isUpvoted: next }
+    })
+  } catch {
+    votes.value = snapshot
+    toast.add({
+      description: 'Failed to save vote',
+      icon: 'i-lucide-alert-circle',
+      color: 'error'
+    })
+  }
+}
+
+onMounted(() => {
+  if (isOwner.value && data.value?.messages.length === 1) {
+    regenerate()
+  }
+})
+</script>
+
+<template>
+  <UDashboardPanel
+    v-if="data?.id"
+    id="chat"
+    class="relative min-h-0"
+    :ui="{ body: 'p-0 sm:p-0 overscroll-none scroll-pt-(--ui-header-height)' }"
+  >
+    <template #header>
+      <Navbar>
+        <template #title>
+          <ChatTitle
+            :chat-id="data!.id"
+            :title="title"
+            :is-owner="isOwner"
+            @update:title="title = $event"
+          />
+        </template>
+
+        <ChatVisibility
+          v-if="isOwner"
+          :chat-id="data!.id"
+          :visibility="visibility"
+          @update:visibility="visibility = $event"
+        />
+      </Navbar>
+    </template>
+
+    <template #body>
+      <div class="flex flex-1">
+        <UContainer class="flex-1 flex flex-col gap-4 sm:gap-6">
+          <UChatMessages
+            should-auto-scroll
+            :messages="messages"
+            :status="status"
+            :class="['pt-(--ui-header-height)', !isOwner && 'pb-4 sm:pb-6']"
+            :ui="{ footer: 'pt-4 sm:pt-6' }"
+          >
+            <template #indicator>
+              <div class="flex items-center gap-1.5">
+                <ChatIndicator />
+
+                <UChatShimmer text="Thinking..." class="text-sm" />
+              </div>
+            </template>
+
+            <template #files="{ message, parts }">
+              <UChatAttachment
+                v-for="(part, index) in parts"
+                :key="`${message.id}-${index}`"
+                :name="removeRandomSuffix(getFileName(part.url))"
+                :type="part.mediaType"
+                :url="part.url"
+                :icon="getFileIcon(part.mediaType, part.url)"
+              />
+            </template>
+
+            <template #content="{ message, streaming }">
+              <ChatMessageContent
+                :message="message"
+                :streaming="streaming"
+                :editing="isOwner && editingMessageId === message.id"
+                @save="saveEdit"
+                @cancel-edit="editingMessageId = null"
+              />
+            </template>
+
+            <template v-if="isOwner" #actions="{ message }">
+              <ChatMessageActions
+                :message="message"
+                :streaming="status === 'streaming' && message.id === messages[messages.length - 1]?.id"
+                :editing="editingMessageId === message.id"
+                :vote="getVote(message.id)"
+                @vote="(_message, isUpvoted) => vote(_message, isUpvoted)"
+                @edit="startEdit"
+                @regenerate="regenerateMessage"
+              />
+            </template>
+
+            <template v-if="isOwner" #footer>
+              <ChatPrompt
+                v-model="input"
+                v-model:files="promptFiles"
+                v-model:queue="queue"
+                :status="status"
+                :error="error"
+                :uploads="files"
+                :uploading="uploading"
+                class="[view-transition-name:chat-prompt] rounded-b-none backdrop-blur-sm"
+                @submit="handleSubmit"
+                @send="onSend"
+                @stop="stop()"
+                @reload="regenerate()"
+              />
+            </template>
+          </UChatMessages>
+        </UContainer>
+      </div>
+    </template>
+  </UDashboardPanel>
+
+  <UContainer v-else class="flex-1 flex flex-col gap-4 sm:gap-6">
+    <UError :error="{ statusMessage: 'Chat not found', statusCode: 404 }" class="min-h-full" />
+  </UContainer>
+</template>

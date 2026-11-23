@@ -1,0 +1,16 @@
+allowBuilds:
+  '@parcel/watcher': false
+  '@tailwindcss/oxide': false
+  esbuild: false
+  unrs-resolver: false
+  vue-demi: false
+
+minimumReleaseAgeExclude:
+  - '@nuxt/ui'
+
+overrides:
+  # Pin h3 to v1: nuxt-csurf imports the hoisted h3 and uses the v1 API (getHeader, getCookie)
+  h3: 1.15.11
+  # devframe (loaded by @nuxt/fonts and @eslint/config-inspector) imports `H3` and needs h3 v2
+  devframe>h3: ^2.0.8
+  devframe>crossws: ^0.4.17
